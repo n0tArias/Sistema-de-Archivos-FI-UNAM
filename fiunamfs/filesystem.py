@@ -1,4 +1,7 @@
-from .directory import Directory
+import math
+import os
+
+from .directory import Directory, DirectoryEntry
 from .disk import CLUSTER_SIZE, FiUnamFSDisk
 from .exceptions import FilesystemError
 from .superblock import Superblock
@@ -45,7 +48,33 @@ class FiUnamFS:
 
     # --- Fase 4 ---
     def cp_in(self, host_path: str, fs_name: str) -> None:
-        raise NotImplementedError("Fase 4")
+        if not os.path.exists(host_path):
+            raise FilesystemError(f"Archivo no encontrado: '{host_path}'")
+
+        size = os.path.getsize(host_path)
+
+        if self.directory.find(fs_name) is not None:
+            raise FilesystemError(f"'{fs_name}' ya existe en el sistema")
+
+        clusters_needed = math.ceil(size / CLUSTER_SIZE) if size else 0
+
+        start = self.directory.find_contiguous_clusters(clusters_needed)
+        if start is None:
+            raise FilesystemError(
+                "Espacio contiguo insuficiente. "
+                "Sugerencia: intente ejecutar -defrag"
+            )
+
+        entry = DirectoryEntry.new_file(fs_name, size, start)
+        self.directory.add_entry(entry)
+
+        with open(host_path, 'rb') as src:
+            for current_cluster in range(start, start + clusters_needed):
+                chunk = src.read(CLUSTER_SIZE)
+                self.disk.write_cluster(
+                    current_cluster,
+                    chunk.ljust(CLUSTER_SIZE, b'\x00'),
+                )
 
     # --- Fase 5 ---
     def rm(self, fs_name: str) -> None:
