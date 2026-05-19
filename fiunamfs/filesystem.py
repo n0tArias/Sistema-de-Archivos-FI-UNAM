@@ -78,7 +78,26 @@ class FiUnamFS:
 
     # --- Fase 5 ---
     def rm(self, fs_name: str) -> None:
-        raise NotImplementedError("Fase 5")
+        if self.directory.find(fs_name) is None:
+            raise FilesystemError(f"Archivo no encontrado: '{fs_name}'")
+        self.directory.delete_entry(fs_name)
 
     def defrag(self) -> None:
-        raise NotImplementedError("Fase 5")
+        files = sorted(
+            self.directory.list_files(), key=lambda e: e.start_cluster
+        )
+        current_free_cluster = self.superblock.data_start_cluster
+
+        for entry in files:
+            n = entry.clusters_needed()
+            if entry.start_cluster != current_free_cluster:
+                for i in range(n):
+                    block = self.disk.read_cluster(entry.start_cluster + i)
+                    self.disk.write_cluster(current_free_cluster + i, block)
+                entry.start_cluster = current_free_cluster
+                self.directory.update_entry(entry)
+            current_free_cluster += n
+
+        null_cluster = b'\x00' * CLUSTER_SIZE
+        for c in range(current_free_cluster, self.superblock.total_clusters):
+            self.disk.write_cluster(c, null_cluster)
