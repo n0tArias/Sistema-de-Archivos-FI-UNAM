@@ -1,5 +1,7 @@
 import math
 import os
+import queue
+import threading
 
 from .directory import Directory, DirectoryEntry
 from .disk import CLUSTER_SIZE, FiUnamFSDisk
@@ -34,17 +36,55 @@ class FiUnamFS:
         if entry is None:
             raise FilesystemError(f"Archivo no encontrado: '{fs_name}'")
 
-        remaining = entry.size
-        with open(host_path, 'wb') as out:
-            for c in range(
-                entry.start_cluster,
-                entry.start_cluster + entry.clusters_needed(),
-            ):
-                block = self.disk.read_cluster(c)
-                # El último cluster puede tener padding nulo; se recorta
-                # al mínimo entre CLUSTER_SIZE y los bytes que faltan.
-                out.write(block[:remaining])
-                remaining -= CLUSTER_SIZE
+        # Cola sin límite de tamaño: el disco máximo es 1.4 MB, así que el lector
+        # puede adelantarse sin riesgo y evitamos deadlocks si el escritor falla.
+        q: queue.Queue[bytes | None] = queue.Queue()
+
+        # Lista mutable porque las closures no pueden reasignar variables del scope
+        # padre — con .append() sí podemos escribir en ella desde los hilos hijos.
+        errores: list[Exception] = []
+        abortar = threading.Event()
+
+        def lector() -> None:
+            try:
+                remaining = entry.size
+                for c in range(
+                    entry.start_cluster,
+                    entry.start_cluster + entry.clusters_needed(),
+                ):
+                    if abortar.is_set():
+                        break
+                    bloque = self.disk.read_cluster(c)
+                    # bloque[:remaining] recorta el padding nulo del último cluster;
+                    # cuando remaining > CLUSTER_SIZE Python devuelve el slice completo.
+                    q.put_nowait(bloque[:remaining])
+                    remaining -= CLUSTER_SIZE
+            except Exception as exc:
+                errores.append(exc)
+            finally:
+                q.put_nowait(None)  # centinela: le dice al escritor que ya no hay más
+
+        def escritor() -> None:
+            try:
+                with open(host_path, 'wb') as out:
+                    while True:
+                        chunk = q.get()
+                        if chunk is None:
+                            break
+                        out.write(chunk)
+            except Exception as exc:
+                errores.append(exc)
+                abortar.set()  # le pide al lector que deje de producir
+
+        t_lector = threading.Thread(target=lector, daemon=True, name='cp_out-lector')
+        t_escritor = threading.Thread(target=escritor, daemon=True, name='cp_out-escritor')
+        t_lector.start()
+        t_escritor.start()
+        t_lector.join()
+        t_escritor.join()
+
+        if errores:
+            raise errores[0]
 
     # --- Fase 4 ---
     def cp_in(self, host_path: str, fs_name: str) -> None:
@@ -68,13 +108,47 @@ class FiUnamFS:
         entry = DirectoryEntry.new_file(fs_name, size, start)
         self.directory.add_entry(entry)
 
-        with open(host_path, 'rb') as src:
-            for current_cluster in range(start, start + clusters_needed):
-                chunk = src.read(CLUSTER_SIZE)
-                self.disk.write_cluster(
-                    current_cluster,
-                    chunk.ljust(CLUSTER_SIZE, b'\x00'),
-                )
+        q: queue.Queue[bytes | None] = queue.Queue()
+        errores: list[Exception] = []
+        abortar = threading.Event()
+
+        def lector() -> None:
+            try:
+                with open(host_path, 'rb') as src:
+                    for _ in range(clusters_needed):
+                        if abortar.is_set():
+                            break
+                        chunk = src.read(CLUSTER_SIZE)
+                        # El último chunk puede ser menor que CLUSTER_SIZE; se rellena
+                        # con ceros para respetar la alineación de cluster del disco.
+                        q.put_nowait(chunk.ljust(CLUSTER_SIZE, b'\x00'))
+            except Exception as exc:
+                errores.append(exc)
+            finally:
+                q.put_nowait(None)
+
+        def escritor() -> None:
+            try:
+                current_cluster = start
+                while True:
+                    data = q.get()
+                    if data is None:
+                        break
+                    self.disk.write_cluster(current_cluster, data)
+                    current_cluster += 1
+            except Exception as exc:
+                errores.append(exc)
+                abortar.set()
+
+        t_lector = threading.Thread(target=lector, daemon=True, name='cp_in-lector')
+        t_escritor = threading.Thread(target=escritor, daemon=True, name='cp_in-escritor')
+        t_lector.start()
+        t_escritor.start()
+        t_lector.join()
+        t_escritor.join()
+
+        if errores:
+            raise errores[0]
 
     # --- Fase 5 ---
     def rm(self, fs_name: str) -> None:

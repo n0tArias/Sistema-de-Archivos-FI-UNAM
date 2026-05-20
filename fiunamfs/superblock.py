@@ -3,8 +3,9 @@ import struct
 from .disk import CLUSTER_SIZE, FiUnamFSDisk
 from .exceptions import SuperblockError
 
-# Distribución binaria exacta de los primeros 64 bytes del cluster 0.
-# Los 'x' son gaps de alineación que no transportan información.
+# Distribución binaria de los primeros 64 bytes del superbloque (cluster 0).
+# Offset 0 : 5x reservados | 9s nombre FS | 5s versión | 1x sep | 16s etiqueta de volumen
+# Offset 36: 4x relleno | I cluster_size | 6x | I dir_clusters | 6x | I total_clusters
 _FMT = '<5x9s5s1x16s4xI6xI6xI'
 _FMT_SIZE = struct.calcsize(_FMT)   # == 64
 

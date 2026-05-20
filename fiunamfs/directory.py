@@ -7,6 +7,8 @@ from .exceptions import DirectoryError
 from .superblock import Superblock
 
 # Distribución binaria de 64 bytes por entrada de directorio.
+# '<': little-endian | 1s: tipo (b'-' activo / b'/' libre) | 15s: nombre
+# II: tamaño y cluster inicial (uint32 c/u) | 6x: relleno | 14s: ctime | 6x | 14s: mtime
 _ENTRY_FMT = '<1s15sII6x14s6x14s'
 ENTRY_SIZE = struct.calcsize(_ENTRY_FMT)   # == 64
 
@@ -153,6 +155,8 @@ class Directory:
     def _load(self) -> None:
         total_bytes = self._sb.dir_clusters * CLUSTER_SIZE
         raw = self._disk.read_bytes(self._dir_offset(), total_bytes)
+        # Rebanamos el bloque crudo en trozos de ENTRY_SIZE y deserializamos cada uno;
+        # i coincide con la ranura física de la entrada dentro del directorio en disco.
         self._entries = [
             DirectoryEntry.from_bytes(
                 raw[i * ENTRY_SIZE:(i + 1) * ENTRY_SIZE], i
@@ -195,6 +199,9 @@ class Directory:
         if n == 0:
             return self._sb.data_start_cluster
         occupied = self.used_clusters()
+        # Rastreamos la racha libre actual con (run_start, run_len).
+        # Al topar con un cluster ocupado reiniciamos: run_start salta al siguiente
+        # candidato y run_len vuelve a cero sin necesidad de retroceder.
         run_start = self._sb.data_start_cluster
         run_len = 0
         for c in range(
